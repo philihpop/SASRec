@@ -93,14 +93,18 @@ class WarpSampler(object):
 
 
 # train/val/test data generation
-def data_partition(fname):
+def data_partition(fname, train_ratio=0.6, val_ratio=0.2):
+    """
+    Per-user split: 60% train, 20% val, 20% test
+    Works cleanly with 5-core (min 5 interactions)
+    """
     usernum = 0
     itemnum = 0
     User = defaultdict(list)
     user_train = {}
     user_valid = {}
     user_test = {}
-    # assume user/item index starting from 1
+    
     f = open('data/%s.txt' % fname, 'r')
     for line in f:
         u, i = line.rstrip().split(' ')
@@ -109,82 +113,107 @@ def data_partition(fname):
         usernum = max(u, usernum)
         itemnum = max(i, itemnum)
         User[u].append(i)
-
+    f.close()
+    
     for user in User:
         nfeedback = len(User[user])
+        
         if nfeedback < 3:
             user_train[user] = User[user]
             user_valid[user] = []
             user_test[user] = []
         else:
-            user_train[user] = User[user][:-2]
-            user_valid[user] = []
-            user_valid[user].append(User[user][-2])
-            user_test[user] = []
-            user_test[user].append(User[user][-1])
+            train_end = int(nfeedback * train_ratio)
+            val_end = int(nfeedback * (train_ratio + val_ratio))
+            
+            user_train[user] = User[user][:train_end]
+            user_valid[user] = User[user][train_end:val_end]
+            user_test[user] = User[user][val_end:]
+    
     return [user_train, user_valid, user_test, usernum, itemnum]
 
 # TODO: merge evaluate functions for test and val set
 # evaluate on test set
-def evaluate(model, dataset, args):
+def evaluate(model, dataset, args, K_list=[5, 10, 20, 50]):
+    """Full ranking evaluation (rank against ALL items)"""
     [train, valid, test, usernum, itemnum] = copy.deepcopy(dataset)
 
-    NDCG = 0.0
-    HT = 0.0
+    metrics = {k: {'NDCG': 0.0, 'Recall': 0.0} for k in K_list}
     valid_user = 0.0
 
-    if usernum>10000:
+    if usernum > 10000:
         users = random.sample(range(1, usernum + 1), 10000)
     else:
         users = range(1, usernum + 1)
+        
     for u in users:
-
         if len(train[u]) < 1 or len(test[u]) < 1: continue
 
         seq = np.zeros([args.maxlen], dtype=np.int32)
         idx = args.maxlen - 1
-        seq[idx] = valid[u][0]
+        seq[idx] = valid[u][0] if len(valid[u]) > 0 else 0
         idx -= 1
         for i in reversed(train[u]):
             seq[idx] = i
             idx -= 1
             if idx == -1: break
+        
+        # Rank against ALL items
         rated = set(train[u])
-        rated.add(0)
-        item_idx = [test[u][0]]
-        for _ in range(100):
-            t = np.random.randint(1, itemnum + 1)
-            while t in rated: t = np.random.randint(1, itemnum + 1)
-            item_idx.append(t)
-
-        predictions = -model.predict(*[np.array(l) for l in [[u], [seq], item_idx]])
-        predictions = predictions[0] # - for 1st argsort DESC
-
-        rank = predictions.argsort().argsort()[0].item()
+        if len(valid[u]) > 0:
+            rated.add(valid[u][0])
+        rated.add(0)  # padding
+        
+        # Full item set
+        all_items = list(range(1, itemnum + 1))
+        target_item = test[u][0]
+        
+        # Predict scores for all items
+        predictions = -model.predict(*[np.array(l) for l in [[u], [seq], all_items]])
+        predictions = predictions[0]  # Shape: [itemnum]
+        
+        # Mask out training/validation items (set to -inf so they rank last)
+        for rated_item in rated:
+            if rated_item > 0 and rated_item <= itemnum:
+                predictions[rated_item - 1] = float('inf')  # -(-inf) = inf, ranks last
+        
+        # Get rank of target item
+        rank = predictions.argsort().argsort()[target_item - 1].item()
 
         valid_user += 1
 
-        if rank < 10:
-            NDCG += 1 / np.log2(rank + 2)
-            HT += 1
+        # Compute metrics for each K
+        for k in K_list:
+            if rank < k:
+                metrics[k]['NDCG'] += 1 / np.log2(rank + 2)
+                metrics[k]['Recall'] += 1
+                
         if valid_user % 100 == 0:
             print('.', end="")
             sys.stdout.flush()
 
-    return NDCG / valid_user, HT / valid_user
-
+    results = {}
+    for k in K_list:
+        results[k] = {
+            'NDCG': metrics[k]['NDCG'] / valid_user,
+            'Recall': metrics[k]['Recall'] / valid_user
+        }
+    
+    return results
 
 # evaluate on val set
-def evaluate_valid(model, dataset, args):
+def evaluate_valid(model, dataset, args, K_list=[5, 10, 20, 50]):
+    """Full ranking evaluation on validation set"""
     [train, valid, test, usernum, itemnum] = copy.deepcopy(dataset)
 
-    NDCG = 0.0
+    metrics = {k: {'NDCG': 0.0, 'Recall': 0.0} for k in K_list}
     valid_user = 0.0
-    HT = 0.0
-    if usernum>10000:
+
+    if usernum > 10000:
         users = random.sample(range(1, usernum + 1), 10000)
     else:
         users = range(1, usernum + 1)
+        
     for u in users:
         if len(train[u]) < 1 or len(valid[u]) < 1: continue
 
@@ -195,26 +224,44 @@ def evaluate_valid(model, dataset, args):
             idx -= 1
             if idx == -1: break
 
+        # Rank against ALL items
         rated = set(train[u])
-        rated.add(0)
-        item_idx = [valid[u][0]]
-        for _ in range(100):
-            t = np.random.randint(1, itemnum + 1)
-            while t in rated: t = np.random.randint(1, itemnum + 1)
-            item_idx.append(t)
-
-        predictions = -model.predict(*[np.array(l) for l in [[u], [seq], item_idx]])
-        predictions = predictions[0]
-
-        rank = predictions.argsort().argsort()[0].item()
+        rated.add(0)  # padding
+        
+        # Full item set
+        all_items = list(range(1, itemnum + 1))
+        target_item = valid[u][0]
+        
+        # Predict scores for all items
+        predictions = -model.predict(*[np.array(l) for l in [[u], [seq], all_items]])
+        predictions = predictions[0]  # Shape: [itemnum]
+        
+        # Mask out training items (set to -inf so they rank last)
+        for rated_item in rated:
+            if rated_item > 0 and rated_item <= itemnum:
+                predictions[rated_item - 1] = float('inf')  # -(-inf) = inf, ranks last
+        
+        # Get rank of target item
+        rank = predictions.argsort().argsort()[target_item - 1].item()
 
         valid_user += 1
 
-        if rank < 10:
-            NDCG += 1 / np.log2(rank + 2)
-            HT += 1
+        # Compute metrics for each K
+        for k in K_list:
+            if rank < k:
+                metrics[k]['NDCG'] += 1 / np.log2(rank + 2)
+                metrics[k]['Recall'] += 1
+                
         if valid_user % 100 == 0:
             print('.', end="")
             sys.stdout.flush()
 
-    return NDCG / valid_user, HT / valid_user
+    # Normalize by number of users
+    results = {}
+    for k in K_list:
+        results[k] = {
+            'NDCG': metrics[k]['NDCG'] / valid_user,
+            'Recall': metrics[k]['Recall'] / valid_user
+        }
+    
+    return results
